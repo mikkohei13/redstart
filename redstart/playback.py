@@ -35,19 +35,32 @@ class PlaybackEngine:
         self._cursor = 0  # next sample to submit
         self._playing = False
         self._finished = False
+        self._loop = False
         self._stream: sd.OutputStream | None = None
         # Mapping: source sample at buffer start <-> DAC time of that sample.
         self._dac_time_anchor: float | None = None
         self._source_sample_anchor = 0
 
     def load(self, document: AudioDocument) -> None:
+        self.load_buffer(document.samples[:, 0], document.sample_rate, loop=False)
+
+    def load_buffer(
+        self,
+        samples: np.ndarray,
+        sample_rate: int,
+        *,
+        loop: bool = False,
+    ) -> None:
+        """Swap in a mono float32 PCM buffer. Stops any current stream."""
+        mono = np.ascontiguousarray(np.asarray(samples, dtype=np.float32).reshape(-1))
         self.stop()
         with self._lock:
-            self._samples = document.samples[:, 0]
-            self._sample_rate = document.sample_rate
+            self._samples = mono
+            self._sample_rate = int(sample_rate)
             self._cursor = 0
             self._playing = False
             self._finished = False
+            self._loop = bool(loop)
             self._clear_timing_anchor()
 
     def play(self) -> None:
@@ -93,6 +106,7 @@ class PlaybackEngine:
             self._playing = False
             self._cursor = 0
             self._finished = False
+            self._loop = False
             self._clear_timing_anchor()
 
     def seek(self, seconds: float) -> None:
@@ -166,22 +180,51 @@ class PlaybackEngine:
                 outdata.fill(0)
                 return
 
-            remaining = len(self._samples) - self._cursor
-            if remaining <= 0:
+            samples = self._samples
+            n_samples = len(samples)
+            if n_samples <= 0:
                 outdata.fill(0)
                 self._playing = False
                 self._finished = True
                 self._clear_timing_anchor()
                 return
 
+            if self._cursor >= n_samples:
+                if self._loop:
+                    self._cursor = 0
+                else:
+                    outdata.fill(0)
+                    self._playing = False
+                    self._finished = True
+                    self._clear_timing_anchor()
+                    return
+
             # Anchor this buffer: first written sample becomes audible at dac time.
             self._dac_time_anchor = float(time.outputBufferDacTime)
             self._source_sample_anchor = self._cursor
 
-            n = min(frames, remaining)
-            outdata[:n, 0] = self._samples[self._cursor : self._cursor + n]
-            if n < frames:
-                outdata[n:].fill(0)
-                self._playing = False
-                self._finished = True
-            self._cursor += n
+            if self._loop:
+                # Fill across wrap boundaries so short loops stay continuous.
+                filled = 0
+                while filled < frames:
+                    remaining = n_samples - self._cursor
+                    if remaining <= 0:
+                        self._cursor = 0
+                        remaining = n_samples
+                    n = min(frames - filled, remaining)
+                    outdata[filled : filled + n, 0] = samples[
+                        self._cursor : self._cursor + n
+                    ]
+                    self._cursor += n
+                    filled += n
+                    if self._cursor >= n_samples:
+                        self._cursor = 0
+            else:
+                remaining = n_samples - self._cursor
+                n = min(frames, remaining)
+                outdata[:n, 0] = samples[self._cursor : self._cursor + n]
+                if n < frames:
+                    outdata[n:].fill(0)
+                    self._playing = False
+                    self._finished = True
+                self._cursor += n

@@ -6,12 +6,13 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QCursor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from redstart.audio_document import AudioDocument, load_wav
+from redstart.isolate import IsolationError, bandpass_slice
 from redstart.playback import PlaybackEngine
 from redstart.settings import AppSettings, ColorPreset, ViewMode, load_settings, save_settings
 from redstart.settings_dialog import SettingsDialog
@@ -66,12 +68,39 @@ class MainWindow(QMainWindow):
         # Ignore ViewBox signals caused by our own setXRange calls.
         self._ignore_range_signal = False
 
+        # Isolation tool state.
+        self._isolation_active = False
+        self._isolation_selection: tuple[float, float, float, float] | None = None
+        self._isolation_origin_s = 0.0
+        self._iso_buffer_active = False  # engine currently holds the filtered loop buffer
+        self._saved_position_s = 0.0
+        self._draw_anchor: QPointF | None = None
+        self._box_item: QGraphicsRectItem | None = None
+
         self._status = QLabel("Open a WAV file to begin.")
         self._play_btn = QPushButton("Play")
         self._play_btn.setEnabled(False)
         # Avoid Space activating the button when focused; Space is the window shortcut.
         self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_btn.clicked.connect(self._toggle_play)
+
+        self._isolate_btn = QPushButton("Isolate")
+        self._isolate_btn.setCheckable(True)
+        self._isolate_btn.setEnabled(False)
+        self._isolate_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._isolate_btn.setToolTip("Draw a box to loop-play a band-passed selection")
+        self._isolate_btn.toggled.connect(self._on_isolate_toggled)
+
+        self._iso_play_btn = QPushButton("Play selection")
+        self._iso_play_btn.setEnabled(False)
+        self._iso_play_btn.setVisible(False)
+        self._iso_play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._iso_play_btn.clicked.connect(self._toggle_isolation_play)
+
+        self._iso_close_btn = QPushButton("Close tool")
+        self._iso_close_btn.setVisible(False)
+        self._iso_close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._iso_close_btn.clicked.connect(self._close_isolation_tool)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Scroll", "scroll")
@@ -100,9 +129,14 @@ class MainWindow(QMainWindow):
         self._plot.addItem(self._playhead)
         self._plot.scene().sigMouseClicked.connect(self._on_plot_click)
         vb.sigRangeChangedManually.connect(self._on_manual_range)
+        self._plot.viewport().setMouseTracking(True)
+        self._plot.viewport().installEventFilter(self)
 
         controls = QHBoxLayout()
         controls.addWidget(self._play_btn)
+        controls.addWidget(self._isolate_btn)
+        controls.addWidget(self._iso_play_btn)
+        controls.addWidget(self._iso_close_btn)
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self._mode_combo)
         controls.addWidget(self._status, stretch=1)
@@ -149,6 +183,26 @@ class MainWindow(QMainWindow):
         self._engine.stop()
         super().closeEvent(event)
 
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self._plot.viewport() and self._isolation_active:
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._on_iso_press(event)
+                    return True
+            elif et == QEvent.Type.MouseMove:
+                if self._draw_anchor is not None:
+                    self._on_iso_move(event)
+                    return True
+            elif et == QEvent.Type.MouseButtonRelease:
+                if (
+                    event.button() == Qt.MouseButton.LeftButton
+                    and self._draw_anchor is not None
+                ):
+                    self._on_iso_release(event)
+                    return True
+        return super().eventFilter(watched, event)
+
     def _sync_mode_combo(self) -> None:
         index = self._mode_combo.findData(self._settings.view_mode)
         self._mode_combo.blockSignals(True)
@@ -187,6 +241,9 @@ class MainWindow(QMainWindow):
         self._image.setLevels(levels)
 
     def load_path(self, path: Path) -> None:
+        if self._isolation_active:
+            self._exit_isolation(restore_document=False)
+
         try:
             document = load_wav(path)
         except Exception as exc:  # noqa: BLE001 — show any load failure
@@ -199,6 +256,7 @@ class MainWindow(QMainWindow):
         self._engine.load(document)
         self._play_btn.setEnabled(False)
         self._play_btn.setText("Play")
+        self._isolate_btn.setEnabled(False)
         self.setWindowTitle(f"Redstart — {path.name}")
         self._status.setText(
             f"Computing spectrogram for {path.name} "
@@ -231,6 +289,7 @@ class MainWindow(QMainWindow):
         self._set_x_range(x0, x1)
         self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
         self._play_btn.setEnabled(True)
+        self._isolate_btn.setEnabled(True)
         self._status.setText(
             f"{path.name}  |  {document.duration_seconds:.1f}s  |  "
             f"{document.sample_rate} Hz"
@@ -273,6 +332,10 @@ class MainWindow(QMainWindow):
     def _toggle_play(self) -> None:
         if self._document is None:
             return
+        if self._isolation_active:
+            if self._isolation_selection is not None:
+                self._toggle_isolation_play()
+            return
         snap = self._engine.snapshot()
         if snap.playing:
             self._engine.pause()
@@ -282,6 +345,198 @@ class MainWindow(QMainWindow):
             self._engine.play()
             self._play_btn.setText("Pause")
 
+    # --- Isolation tool -------------------------------------------------
+
+    def _on_isolate_toggled(self, checked: bool) -> None:
+        if checked:
+            self._enter_isolation()
+        else:
+            self._exit_isolation(restore_document=True)
+
+    def _close_isolation_tool(self) -> None:
+        if self._isolate_btn.isChecked():
+            self._isolate_btn.setChecked(False)
+        else:
+            self._exit_isolation(restore_document=True)
+
+    def _enter_isolation(self) -> None:
+        if self._document is None:
+            self._isolate_btn.blockSignals(True)
+            self._isolate_btn.setChecked(False)
+            self._isolate_btn.blockSignals(False)
+            return
+
+        snap = self._engine.snapshot()
+        self._saved_position_s = snap.position_seconds
+        if snap.playing:
+            self._engine.pause()
+            self._play_btn.setText("Play")
+
+        self._isolation_active = True
+        self._isolation_selection = None
+        self._iso_buffer_active = False
+        self._draw_anchor = None
+        self._clear_box_item()
+        self._play_btn.setEnabled(False)
+        self._iso_play_btn.setVisible(False)
+        self._iso_play_btn.setEnabled(False)
+        self._iso_play_btn.setText("Play selection")
+        self._iso_close_btn.setVisible(True)
+        self._plot.getViewBox().setMouseEnabled(x=False, y=False)
+        self._status.setText("Isolation: drag a box on the spectrogram.")
+
+    def _exit_isolation(self, *, restore_document: bool) -> None:
+        self._isolation_active = False
+        self._isolation_selection = None
+        self._iso_buffer_active = False
+        self._draw_anchor = None
+        self._clear_box_item()
+        self._iso_play_btn.setVisible(False)
+        self._iso_play_btn.setEnabled(False)
+        self._iso_play_btn.setText("Play selection")
+        self._iso_close_btn.setVisible(False)
+        self._plot.getViewBox().setMouseEnabled(x=True, y=False)
+
+        if self._isolate_btn.isChecked():
+            self._isolate_btn.blockSignals(True)
+            self._isolate_btn.setChecked(False)
+            self._isolate_btn.blockSignals(False)
+
+        if self._document is not None:
+            self._play_btn.setEnabled(True)
+            if restore_document:
+                self._engine.load(self._document)
+                self._engine.seek(self._saved_position_s)
+                self._playhead.setValue(self._saved_position_s)
+                self._play_btn.setText("Play")
+                self._status.setText(
+                    f"{self._document.path.name}  |  "
+                    f"{self._document.duration_seconds:.1f}s  |  "
+                    f"{self._document.sample_rate} Hz"
+                )
+
+    def _clear_box_item(self) -> None:
+        if self._box_item is not None:
+            self._plot.removeItem(self._box_item)
+            self._box_item = None
+
+    def _ensure_box_item(self) -> QGraphicsRectItem:
+        if self._box_item is None:
+            item = QGraphicsRectItem()
+            item.setPen(pg.mkPen((255, 220, 40), width=2))
+            item.setBrush(pg.mkBrush(255, 220, 40, 40))
+            item.setZValue(10)
+            self._plot.addItem(item)
+            self._box_item = item
+        return self._box_item
+
+    def _view_pos_from_viewport_event(self, event) -> QPointF:
+        pos = event.position().toPoint()
+        scene_pos = self._plot.mapToScene(pos)
+        return self._plot.getViewBox().mapSceneToView(scene_pos)
+
+    def _clamp_selection(
+        self, t0: float, t1: float, f_low: float, f_high: float
+    ) -> tuple[float, float, float, float]:
+        assert self._document is not None
+        dur = self._document.duration_seconds
+        t0 = max(0.0, min(t0, dur))
+        t1 = max(0.0, min(t1, dur))
+        f_low = max(0.0, min(f_low, FREQ_MAX_HZ))
+        f_high = max(0.0, min(f_high, FREQ_MAX_HZ))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        if f_high < f_low:
+            f_low, f_high = f_high, f_low
+        return t0, t1, f_low, f_high
+
+    def _on_iso_press(self, event) -> None:
+        if self._document is None:
+            return
+        # Redraw replaces any existing selection and stops isolation playback.
+        if self._engine.snapshot().playing:
+            self._engine.pause()
+        self._iso_buffer_active = False
+        self._iso_play_btn.setText("Play selection")
+        self._draw_anchor = self._view_pos_from_viewport_event(event)
+        self._ensure_box_item().setRect(QRectF(self._draw_anchor, self._draw_anchor))
+
+    def _on_iso_move(self, event) -> None:
+        if self._draw_anchor is None:
+            return
+        current = self._view_pos_from_viewport_event(event)
+        self._ensure_box_item().setRect(QRectF(self._draw_anchor, current).normalized())
+
+    def _on_iso_release(self, event) -> None:
+        if self._document is None or self._draw_anchor is None:
+            return
+        current = self._view_pos_from_viewport_event(event)
+        rect = QRectF(self._draw_anchor, current).normalized()
+        self._draw_anchor = None
+
+        t0, t1, f_low, f_high = self._clamp_selection(
+            rect.left(), rect.right(), rect.top(), rect.bottom()
+        )
+        if t1 - t0 < 1e-3 or f_high - f_low < 1.0:
+            self._isolation_selection = None
+            self._clear_box_item()
+            self._iso_play_btn.setVisible(False)
+            self._iso_play_btn.setEnabled(False)
+            self._status.setText("Isolation: selection too small — drag again.")
+            return
+
+        self._isolation_selection = (t0, t1, f_low, f_high)
+        self._isolation_origin_s = t0
+        self._ensure_box_item().setRect(QRectF(t0, f_low, t1 - t0, f_high - f_low))
+        self._iso_play_btn.setVisible(True)
+        self._iso_play_btn.setEnabled(True)
+        self._iso_play_btn.setText("Play selection")
+        self._status.setText(
+            f"Isolation: {t1 - t0:.2f}s × {f_low:.0f}–{f_high:.0f} Hz"
+        )
+
+    def _toggle_isolation_play(self) -> None:
+        if not self._isolation_active or self._isolation_selection is None:
+            return
+        snap = self._engine.snapshot()
+        if snap.playing:
+            self._engine.pause()
+            self._iso_play_btn.setText("Play selection")
+            return
+        if self._iso_buffer_active:
+            self._engine.play()
+            self._iso_play_btn.setText("Pause selection")
+            return
+        self._start_isolation_playback()
+
+    def _start_isolation_playback(self) -> None:
+        if self._document is None or self._isolation_selection is None:
+            return
+        t0, t1, f_low, f_high = self._isolation_selection
+        try:
+            filtered = bandpass_slice(
+                self._document.samples,
+                self._document.sample_rate,
+                t0,
+                t1,
+                f_low,
+                f_high,
+            )
+        except IsolationError as exc:
+            self._status.setText(f"Isolation: {exc}")
+            return
+
+        self._isolation_origin_s = t0
+        self._engine.load_buffer(
+            filtered, self._document.sample_rate, loop=True
+        )
+        self._iso_buffer_active = True
+        self._engine.play()
+        self._iso_play_btn.setText("Pause selection")
+        self._status.setText(
+            f"Isolation playing: {t1 - t0:.2f}s × {f_low:.0f}–{f_high:.0f} Hz (looping)"
+        )
+
     def _set_x_range(self, x0: float, x1: float) -> None:
         self._ignore_range_signal = True
         try:
@@ -290,7 +545,7 @@ class MainWindow(QMainWindow):
             self._ignore_range_signal = False
 
     def _on_manual_range(self, *_args) -> None:
-        if self._ignore_range_signal:
+        if self._ignore_range_signal or self._isolation_active:
             return
         self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
         x0, x1 = self._visible_x_range()
@@ -327,7 +582,7 @@ class MainWindow(QMainWindow):
         return page_x_range_for_time(playhead, width, duration_s=duration_s)
 
     def _align_view_to_playhead(self) -> None:
-        if self._document is None:
+        if self._document is None or self._isolation_active:
             return
         t = self._engine.snapshot().position_seconds
         width = self._visible_width()
@@ -337,6 +592,9 @@ class MainWindow(QMainWindow):
         self._playhead.setValue(t)
 
     def _on_plot_click(self, event) -> None:
+        # Isolation tool owns mouse interaction while active.
+        if self._isolation_active:
+            return
         # Single-click is ignored; double-click seeks the playhead.
         if self._document is None or event.button() != Qt.MouseButton.LeftButton:
             return
@@ -356,6 +614,25 @@ class MainWindow(QMainWindow):
         if self._document is None or self._spectrogram is None:
             return
         snap = self._engine.snapshot()
+
+        if self._isolation_active:
+            if self._iso_buffer_active and self._isolation_selection is not None:
+                # Map isolated buffer time back into document coordinates.
+                span = max(
+                    self._isolation_selection[1] - self._isolation_origin_s, 1e-9
+                )
+                local = snap.position_seconds % span
+                self._playhead.setValue(self._isolation_origin_s + local)
+            else:
+                self._playhead.setValue(self._saved_position_s)
+            if (
+                self._iso_buffer_active
+                and not snap.playing
+                and self._iso_play_btn.text() == "Pause selection"
+            ):
+                self._iso_play_btn.setText("Play selection")
+            return
+
         t = snap.position_seconds
         self._playhead.setValue(t)
 
