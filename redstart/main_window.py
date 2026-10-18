@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QCursor, QGuiApplication, QKeySequence
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from redstart.audio_document import AudioDocument, load_wav
 from redstart.playback import PlaybackEngine
-from redstart.settings import AppSettings, ViewMode, load_settings, save_settings
+from redstart.settings import AppSettings, ColorPreset, ViewMode, load_settings, save_settings
 from redstart.settings_dialog import SettingsDialog
 from redstart.spectrogram import (
     FREQ_MAX_HZ,
@@ -38,8 +39,16 @@ DEFAULT_AUDIO_DIR = (
     Path(__file__).resolve().parent.parent / "audio" / "thorsvik" / "data"
 )
 
-# Fixed display levels in dB (no colour controls in this slice).
-DB_LEVELS = (-80.0, -20.0)
+
+def _spectrogram_lut(colormap: ColorPreset, contrast: float, n: int = 256) -> np.ndarray:
+    """Build an RGB lookup table; contrast warps the colour curve (1 = linear)."""
+    cmap = pg.colormap.get(colormap)
+    contrast = max(float(contrast), 1e-3)
+    if abs(contrast - 1.0) < 1e-6:
+        return cmap.getLookupTable(nPts=n)
+    x = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    mapped = cmap.map(np.power(x, 1.0 / contrast), mode="byte")
+    return np.ascontiguousarray(mapped[:, :3])
 
 
 class MainWindow(QMainWindow):
@@ -81,8 +90,7 @@ class MainWindow(QMainWindow):
         vb.setLimits(yMin=0.0, yMax=FREQ_MAX_HZ)
         self._image = pg.ImageItem(axisOrder="row-major")
         self._plot.addItem(self._image)
-        # Magma-like lookup; pyqtgraph ships several gradients.
-        self._image.setLookupTable(pg.colormap.get("magma").getLookupTable())
+        self._apply_display()
         self._playhead = pg.InfiniteLine(
             pos=0,
             angle=90,
@@ -166,8 +174,17 @@ class MainWindow(QMainWindow):
         self._settings = settings
         save_settings(settings)
         self._sync_mode_combo()
+        self._apply_display()
         self._drive_x = True
         self._align_view_to_playhead()
+
+    def _apply_display(self) -> None:
+        """Update colour LUT and dB levels without recomputing the STFT."""
+        self._image.setLookupTable(
+            _spectrogram_lut(self._settings.colormap, self._settings.contrast)
+        )
+        levels = (self._settings.db_floor, self._settings.db_ceiling)
+        self._image.setLevels(levels)
 
     def load_path(self, path: Path) -> None:
         try:
@@ -223,7 +240,9 @@ class MainWindow(QMainWindow):
         if data.db.size == 0 or data.times_s.size == 0:
             return
 
-        self._image.setImage(data.db, autoLevels=False, levels=DB_LEVELS)
+        levels = (self._settings.db_floor, self._settings.db_ceiling)
+        self._image.setImage(data.db, autoLevels=False, levels=levels)
+        self._apply_display()
 
         t_start = float(data.times_s[0])
         t_end = float(data.times_s[-1])
@@ -348,19 +367,19 @@ class MainWindow(QMainWindow):
 
         if self._settings.view_mode == "scroll":
             # Always keep the playhead at the horizontal center.
-            x0, x1 = scroll_x_range(t, width)
-            self._set_x_range(x0, x1)
+            nx0, nx1 = scroll_x_range(t, width)
+            # Skip no-op range updates; each setXRange triggers a full plot paint.
+            if abs(nx0 - x0) > 1e-4 or abs(nx1 - x1) > 1e-4:
+                self._set_x_range(nx0, nx1)
         else:
             # Page: jump when playhead leaves the right edge while driving/playing.
             if self._drive_x or snap.playing:
                 if t >= x1 - 1e-6 or t < x0:
                     self._drive_x = True
-                    x0, x1 = page_x_range_for_time(
+                    nx0, nx1 = page_x_range_for_time(
                         t, width, duration_s=self._document.duration_seconds
                     )
-                    self._set_x_range(x0, x1)
-
-        self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
+                    self._set_x_range(nx0, nx1)
 
         if not snap.playing and self._play_btn.text() == "Pause":
             self._play_btn.setText("Play")

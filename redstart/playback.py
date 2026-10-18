@@ -62,12 +62,14 @@ class PlaybackEngine:
             sample_rate = self._sample_rate
 
         if self._stream is None:
+            # Prefer a larger buffer over "low" latency: scroll-mode repaints
+            # hold the GIL, and a tiny PortAudio buffer underruns into silence.
             self._stream = sd.OutputStream(
                 samplerate=sample_rate,
                 channels=1,
                 dtype="float32",
                 callback=self._callback,
-                latency="low",
+                latency="high",
             )
             self._stream.start()
 
