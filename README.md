@@ -1,6 +1,10 @@
 # Redstart
 
-Desktop spectrogram player for long WAV recordings.
+Desktop spectrogram player for long nature-sound WAV recordings: scrollable spectrogram view with play/pause/seek synced to the playhead.
+
+## How it’s built
+
+Python desktop app (PySide6 + pyqtgraph). Audio is decoded into an immutable NumPy document (`soundfile`); spectrograms are computed in background STFT chunks (`SciPy`/`NumPy`); playback runs on a PortAudio callback (`sounddevice`) with DAC-timed audible position. A main-thread controller wires UI intents to those services.
 
 ## Run
 
@@ -10,6 +14,14 @@ uv run python -m redstart audio/thorsvik/data/20260418_040000.WAV
 ```
 
 Omit the path to open a file dialog (defaults to `audio/thorsvik/data`).
+
+## Possible future features
+
+- Read bird detection metadata from CSV file
+- Save annotations to CSV/JSON file
+- Export audio files
+- Export observations
+- Cache spectrogram locally
 
 ## Note: playhead vs audible sync
 
