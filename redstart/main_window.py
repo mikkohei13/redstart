@@ -60,6 +60,8 @@ class MainWindow(QMainWindow):
         self._status = QLabel("Open a WAV file to begin.")
         self._play_btn = QPushButton("Play")
         self._play_btn.setEnabled(False)
+        # Avoid Space activating the button when focused; Space is the window shortcut.
+        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_btn.clicked.connect(self._toggle_play)
 
         self._mode_combo = QComboBox()
@@ -129,6 +131,11 @@ class MainWindow(QMainWindow):
         prefs_action.setShortcut(QKeySequence.StandardKey.Preferences)
         prefs_action.triggered.connect(self._open_settings)
         settings_menu.addAction(prefs_action)
+
+        play_pause = QAction("Play/Pause", self)
+        play_pause.setShortcut(QKeySequence(Qt.Key.Key_Space))
+        play_pause.triggered.connect(self._toggle_play)
+        self.addAction(play_pause)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._engine.stop()
@@ -311,7 +318,10 @@ class MainWindow(QMainWindow):
         self._playhead.setValue(t)
 
     def _on_plot_click(self, event) -> None:
+        # Single-click is ignored; double-click seeks the playhead.
         if self._document is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not event.double():
             return
         if not self._plot.sceneBoundingRect().contains(event.scenePos()):
             return
@@ -322,10 +332,6 @@ class MainWindow(QMainWindow):
         self._playhead.setValue(t)
         self._drive_x = True
         self._align_view_to_playhead()
-        # Click seeks and starts playback from that point.
-        if not self._engine.snapshot().playing:
-            self._engine.play()
-            self._play_btn.setText("Pause")
 
     def _on_tick(self) -> None:
         if self._document is None or self._spectrogram is None:
