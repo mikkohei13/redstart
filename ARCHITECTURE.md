@@ -1,6 +1,8 @@
 # Desktop Spectrogram App: Technical Draft
 
-Improtant! This is only a draft / proposal for how to make the app. It can be deviated from if app features, code quality, or iterative development justifies it.
+Important! This is only a draft / proposal for how to make the app. It can be deviated from if app features, code quality, or iterative development justifies it.
+
+This is also somewhat outdated compared to current codebase. No tiling is needed for now.
 
 ## Scope
 
@@ -40,7 +42,6 @@ V1: mono/stereo loading, progressive spectrograms, play/pause/seek, analysis set
 ## 4. View layer
 
 - Create/update widgets and graphics items only on the Qt main thread.
-- Render pyqtgraph `ImageItem` tiles in document coordinates. Cache visible tiles plus neighbours; size tiles by frames/pixels and bound rendered memory.
 - Supply C-contiguous row-major tiles and explicit levels. Reuse images during scrolling; do not rebuild them on every timer tick.
 - A 30–60 Hz timer samples playback snapshots and updates the playhead/view range. It never advances playback time or computes spectra.
 - Colour/dB controls affect rendering only. Log-frequency display requires image resampling/custom mapping, not just log ticks; retain the STFT cache. Maintain inverse coordinate mappings for future selections.
@@ -64,7 +65,7 @@ Add a small built-in registry when processors are implemented. ML remains outsid
 
 ## Delivery and verification
 
-1. Implement decode -> visible tiles -> transport -> synchronized scrolling. Run directly from the Python environment during development.
+1. Implement decode -> visible tiles (no?) -> transport -> synchronized scrolling. Run directly from the Python environment during development.
 2. Package early with PyInstaller on each target OS; include Qt plugins, PortAudio, and libsndfile. Test without Python installed. Plan macOS signing/notarization, Windows installer/signing, and explicit Apple Silicon/Intel support.
 3. Verify chunked STFT against whole-signal output, coordinate/timing mappings, stale-result rejection, cancellation, EOF, device failures, and shutdown.
 4. Benchmark one-hour input during analysis/playback/seeking/scrolling: peak memory, load/analysis latency, UI responsiveness, and underflows. Verify packaged WAV/MP3 decoding on both platforms.

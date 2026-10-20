@@ -253,6 +253,8 @@ class MainWindow(QMainWindow):
         self._engine.stop()
         self._document = document
         self._spectrogram = None
+        # Drop the previous ImageItem buffer before allocating a new one.
+        self._image.clear()
         self._engine.load(document)
         self._play_btn.setEnabled(False)
         self._play_btn.setText("Play")

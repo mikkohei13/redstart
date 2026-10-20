@@ -16,6 +16,8 @@ WINDOW = "hann"
 DB_FLOOR = 1e-10
 VIEWPORT_SECONDS = 60.0
 FREQ_MAX_HZ = 20_000.0
+# Frames per FFT batch: bounds temporaries without needing a progressive UI.
+_BLOCK_FRAMES = 4096
 
 
 @dataclass(frozen=True)
@@ -33,38 +35,57 @@ def compute_full(
     *,
     freq_max_hz: float = FREQ_MAX_HZ,
 ) -> SpectrogramData:
-    """Compute STFT for the entire document (once, at open time)."""
+    """Compute STFT for the entire document (once, at open time).
+
+    Fills a preallocated dB image in frame blocks so peak memory stays near the
+    output size, instead of materialising a full complex STFT at once.
+    Scaling matches ``scipy.signal.stft`` (``scaling='spectrum'``).
+    """
     sr = document.sample_rate
     duration_s = document.duration_seconds
-    chunk = document.samples[:, 0]
+    x = document.samples[:, 0]
 
-    freqs, times_s, zxx = signal.stft(
-        chunk,
-        fs=sr,
-        window=WINDOW,
-        nperseg=FFT_SIZE,
-        noverlap=FFT_SIZE - HOP,
-        nfft=FFT_SIZE,
-        boundary=None,
-        padded=False,
-    )
+    n_frames = max(0, (len(x) - FFT_SIZE) // HOP + 1)
+    freqs = np.fft.rfftfreq(FFT_SIZE, d=1.0 / sr)
+    n_bins = int(np.searchsorted(freqs, freq_max_hz, side="right"))
+    if n_bins <= 0:
+        n_bins = len(freqs)
+    freqs = freqs[:n_bins]
 
-    power = np.abs(zxx) ** 2
+    if n_frames == 0:
+        return SpectrogramData(
+            db=np.empty((n_bins, 0), dtype=np.float32),
+            freqs_hz=np.asarray(freqs, dtype=np.float64),
+            times_s=np.empty(0, dtype=np.float64),
+            duration_s=duration_s,
+        )
 
-    # Crop frequency bins to the display range.
-    freq_mask = freqs <= freq_max_hz
-    if not np.any(freq_mask):
-        freq_mask = np.ones(freqs.shape, dtype=bool)
-    freqs = freqs[freq_mask]
-    power = power[freq_mask, :]
+    window = signal.get_window(WINDOW, FFT_SIZE).astype(np.float64)
+    # Same "spectrum" scaling as scipy.signal.stft.
+    scale = 1.0 / window.sum()
 
-    db = 10.0 * np.log10(np.maximum(power, DB_FLOOR))
-    db = np.ascontiguousarray(db, dtype=np.float32)
+    # Strided view over the PCM: no extra full-file copy of the samples.
+    frames = np.lib.stride_tricks.sliding_window_view(x, FFT_SIZE)[::HOP]
+    db = np.empty((n_bins, n_frames), dtype=np.float32)
+
+    for start in range(0, n_frames, _BLOCK_FRAMES):
+        stop = min(start + _BLOCK_FRAMES, n_frames)
+        # Window in float64, then rfft; crop bins before power/log.
+        block = frames[start:stop].astype(np.float64, copy=False) * window
+        spec = np.fft.rfft(block, n=FFT_SIZE, axis=1)[:, :n_bins]
+        spec *= scale
+        power = spec.real * spec.real + spec.imag * spec.imag
+        np.maximum(power, DB_FLOOR, out=power)
+        np.log10(power, out=power)
+        power *= 10.0
+        db[:, start:stop] = power.T
+
+    times_s = (np.arange(n_frames, dtype=np.float64) * HOP + FFT_SIZE / 2.0) / sr
 
     return SpectrogramData(
         db=db,
         freqs_hz=np.asarray(freqs, dtype=np.float64),
-        times_s=np.asarray(times_s, dtype=np.float64),
+        times_s=times_s,
         duration_s=duration_s,
     )
 
