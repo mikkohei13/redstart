@@ -153,10 +153,15 @@ class PlaybackEngine:
             write_cursor = self._cursor
             n = len(self._samples)
             sr = self._sample_rate
+            loop = self._loop
 
         # stream.time shares the PortAudio clock with outputBufferDacTime.
         elapsed = stream.time - dac_anchor
         pos = source_anchor + int(elapsed * sr)
+        if loop:
+            # Write cursor wraps to 0 before those samples are audible; clamping
+            # to it would jump the playhead early. Wrap into the loop instead.
+            return pos % n if n > 0 else 0
         # Cannot have heard samples that have not been submitted yet.
         return max(0, min(pos, write_cursor, n))
 
