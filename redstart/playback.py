@@ -170,12 +170,9 @@ class PlaybackEngine:
         outdata: np.ndarray,
         frames: int,
         time,
-        status: sd.CallbackFlags,
+        _status: sd.CallbackFlags,
     ) -> None:
         # Callback restrictions: no Qt, no I/O, no blocking beyond the lock.
-        if status:
-            pass
-
         with self._lock:
             if (
                 not self._playing

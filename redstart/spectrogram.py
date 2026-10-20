@@ -27,7 +27,6 @@ class SpectrogramData:
     db: np.ndarray  # float32, shape (n_freqs, n_frames), row-major
     freqs_hz: np.ndarray
     times_s: np.ndarray  # frame centres in document seconds
-    duration_s: float
 
 
 def compute_full(
@@ -42,7 +41,6 @@ def compute_full(
     Scaling matches ``scipy.signal.stft`` (``scaling='spectrum'``).
     """
     sr = document.sample_rate
-    duration_s = document.duration_seconds
     x = document.samples[:, 0]
 
     n_frames = max(0, (len(x) - FFT_SIZE) // HOP + 1)
@@ -57,7 +55,6 @@ def compute_full(
             db=np.empty((n_bins, 0), dtype=np.float32),
             freqs_hz=np.asarray(freqs, dtype=np.float64),
             times_s=np.empty(0, dtype=np.float64),
-            duration_s=duration_s,
         )
 
     window = signal.get_window(WINDOW, FFT_SIZE).astype(np.float64)
@@ -86,28 +83,14 @@ def compute_full(
         db=db,
         freqs_hz=np.asarray(freqs, dtype=np.float64),
         times_s=times_s,
-        duration_s=duration_s,
     )
 
 
-def viewport_start_for_time(t: float, duration: float = VIEWPORT_SECONDS) -> float:
-    """Snap a playhead time to the start of its viewport page."""
-    if t < 0:
-        return 0.0
-    return (int(t // duration)) * duration
-
-
-def scroll_x_range(
-    playhead: float,
-    width: float,
-    *,
-    duration_s: float | None = None,
-) -> tuple[float, float]:
+def scroll_x_range(playhead: float, width: float) -> tuple[float, float]:
     """X range with playhead always at the horizontal center.
 
     May extend before 0 or past the file end so the playhead stays centered.
     """
-    _ = duration_s
     width = max(width, 1e-3)
     half = width / 2.0
     return playhead - half, playhead + half
@@ -123,18 +106,7 @@ def page_x_range_for_time(
     width = max(width, 1e-3)
     if duration_s <= width:
         return 0.0, max(duration_s, width)
-    t0 = viewport_start_for_time(playhead, width)
-    # Last page may start earlier so the window stays full-width.
-    max_t0 = max(0.0, duration_s - width)
-    t0 = min(t0, max_t0)
+    # Snap to page start; last page may start earlier so the window stays full-width.
+    t0 = max(0.0, (int(playhead // width)) * width)
+    t0 = min(t0, max(0.0, duration_s - width))
     return t0, t0 + width
-
-
-def page_x_range_after_jump(
-    playhead: float,
-    width: float,
-    *,
-    duration_s: float,
-) -> tuple[float, float]:
-    """After playhead hits the right edge, show the next page of `width`."""
-    return page_x_range_for_time(playhead, width, duration_s=duration_s)

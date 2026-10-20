@@ -71,7 +71,6 @@ class MainWindow(QMainWindow):
         # Isolation tool state.
         self._isolation_active = False
         self._isolation_selection: tuple[float, float, float, float] | None = None
-        self._isolation_origin_s = 0.0
         self._iso_buffer_active = False  # engine currently holds the filtered loop buffer
         self._saved_position_s = 0.0
         self._draw_anchor: QPointF | None = None
@@ -301,8 +300,7 @@ class MainWindow(QMainWindow):
         if data.db.size == 0 or data.times_s.size == 0:
             return
 
-        levels = (self._settings.db_floor, self._settings.db_ceiling)
-        self._image.setImage(data.db, autoLevels=False, levels=levels)
+        self._image.setImage(data.db, autoLevels=False)
         self._apply_display()
 
         t_start = float(data.times_s[0])
@@ -316,7 +314,6 @@ class MainWindow(QMainWindow):
 
         f_top = float(data.freqs_hz[-1]) if len(data.freqs_hz) else FREQ_MAX_HZ
         self._image.setRect(QRectF(x0, 0.0, x1 - x0, f_top))
-        self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
 
     def _open_file_dialog(self) -> None:
         start_dir = (
@@ -488,7 +485,6 @@ class MainWindow(QMainWindow):
             return
 
         self._isolation_selection = (t0, t1, f_low, f_high)
-        self._isolation_origin_s = t0
         self._ensure_box_item().setRect(QRectF(t0, f_low, t1 - t0, f_high - f_low))
         self._iso_play_btn.setVisible(True)
         self._iso_play_btn.setEnabled(True)
@@ -528,7 +524,6 @@ class MainWindow(QMainWindow):
             self._status.setText(f"Isolation: {exc}")
             return
 
-        self._isolation_origin_s = t0
         self._engine.load_buffer(
             filtered, self._document.sample_rate, loop=True
         )
@@ -578,10 +573,11 @@ class MainWindow(QMainWindow):
 
     def _mode_x_range(self, playhead: float, width: float) -> tuple[float, float]:
         assert self._document is not None
-        duration_s = self._document.duration_seconds
         if self._settings.view_mode == "scroll":
-            return scroll_x_range(playhead, width, duration_s=duration_s)
-        return page_x_range_for_time(playhead, width, duration_s=duration_s)
+            return scroll_x_range(playhead, width)
+        return page_x_range_for_time(
+            playhead, width, duration_s=self._document.duration_seconds
+        )
 
     def _align_view_to_playhead(self) -> None:
         if self._document is None or self._isolation_active:
@@ -620,11 +616,10 @@ class MainWindow(QMainWindow):
         if self._isolation_active:
             if self._iso_buffer_active and self._isolation_selection is not None:
                 # Map isolated buffer time back into document coordinates.
-                span = max(
-                    self._isolation_selection[1] - self._isolation_origin_s, 1e-9
-                )
+                t0, t1, _, _ = self._isolation_selection
+                span = max(t1 - t0, 1e-9)
                 local = snap.position_seconds % span
-                self._playhead.setValue(self._isolation_origin_s + local)
+                self._playhead.setValue(t0 + local)
             else:
                 self._playhead.setValue(self._saved_position_s)
             if self._iso_buffer_active:
