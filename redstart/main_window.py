@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QCursor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGraphicsRectItem,
     QHBoxLayout,
@@ -23,6 +24,12 @@ from PySide6.QtWidgets import (
 )
 
 from redstart.audio_document import AudioDocument, load_wav
+from redstart.detections import (
+    Detection,
+    assign_lanes,
+    find_detections_csv,
+    load_detections,
+)
 from redstart.isolate import IsolationError, bandpass_slice
 from redstart.playback import PlaybackEngine
 from redstart.settings import AppSettings, ColorPreset, ViewMode, load_settings, save_settings
@@ -35,6 +42,12 @@ from redstart.spectrogram import (
     page_x_range_for_time,
     scroll_x_range,
 )
+
+# Detection overlays sit near the top of the spectrogram (CSV has no frequency).
+_DETECTION_LANE_TOP_HZ = FREQ_MAX_HZ - 400.0
+_DETECTION_LANE_STEP_HZ = 700.0
+_DETECTION_TICK_HALF_HZ = 200.0
+_DETECTION_COLOR = (255, 220, 40)
 
 # Default folder for the open dialog.
 DEFAULT_AUDIO_DIR = (
@@ -76,6 +89,10 @@ class MainWindow(QMainWindow):
         self._draw_anchor: QPointF | None = None
         self._box_item: QGraphicsRectItem | None = None
 
+        # Bird detection overlays (loaded from companion CSV on demand).
+        self._detections: list[Detection] = []
+        self._detection_items: list[object] = []
+
         self._status = QLabel("Open a WAV file to begin.")
         self._play_btn = QPushButton("Play")
         self._play_btn.setEnabled(False)
@@ -100,6 +117,23 @@ class MainWindow(QMainWindow):
         self._iso_close_btn.setVisible(False)
         self._iso_close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._iso_close_btn.clicked.connect(self._close_isolation_tool)
+
+        self._detections_btn = QPushButton("Detections")
+        self._detections_btn.setEnabled(False)
+        self._detections_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._detections_btn.setToolTip(
+            "Load bird detections from a CSV next to the audio file"
+        )
+        self._detections_btn.clicked.connect(self._load_detections)
+
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setRange(0.0, 1.0)
+        self._threshold_spin.setSingleStep(0.05)
+        self._threshold_spin.setDecimals(2)
+        self._threshold_spin.setValue(0.75)
+        self._threshold_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._threshold_spin.setToolTip("Hide detections below this confidence")
+        self._threshold_spin.valueChanged.connect(self._on_threshold_changed)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Scroll", "scroll")
@@ -136,6 +170,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._isolate_btn)
         controls.addWidget(self._iso_play_btn)
         controls.addWidget(self._iso_close_btn)
+        controls.addWidget(self._detections_btn)
+        controls.addWidget(QLabel("Min"))
+        controls.addWidget(self._threshold_spin)
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self._mode_combo)
         controls.addWidget(self._status, stretch=1)
@@ -252,12 +289,14 @@ class MainWindow(QMainWindow):
         self._engine.stop()
         self._document = document
         self._spectrogram = None
+        self._clear_detections()
         # Drop the previous ImageItem buffer before allocating a new one.
         self._image.clear()
         self._engine.load(document)
         self._play_btn.setEnabled(False)
         self._play_btn.setText("Play")
         self._isolate_btn.setEnabled(False)
+        self._detections_btn.setEnabled(False)
         self.setWindowTitle(f"Redstart — {path.name}")
         self._status.setText(
             f"Computing spectrogram for {path.name} "
@@ -291,6 +330,7 @@ class MainWindow(QMainWindow):
         self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
         self._play_btn.setEnabled(True)
         self._isolate_btn.setEnabled(True)
+        self._detections_btn.setEnabled(True)
         self._status.setText(
             f"{path.name}  |  {document.duration_seconds:.1f}s  |  "
             f"{document.sample_rate} Hz"
@@ -413,6 +453,81 @@ class MainWindow(QMainWindow):
                     f"{self._document.duration_seconds:.1f}s  |  "
                     f"{self._document.sample_rate} Hz"
                 )
+
+    def _clear_detections(self) -> None:
+        self._detections = []
+        self._clear_detection_overlays()
+
+    def _clear_detection_overlays(self) -> None:
+        for item in self._detection_items:
+            self._plot.removeItem(item)
+        self._detection_items = []
+
+    def _load_detections(self) -> None:
+        if self._document is None:
+            return
+        csv_path = find_detections_csv(self._document.path)
+        if csv_path is None:
+            self._status.setText("No detection CSV found.")
+            QMessageBox.information(
+                self,
+                "Detections",
+                "No CSV file found that begins with the audio file name.",
+            )
+            return
+        try:
+            detections = load_detections(csv_path)
+        except Exception as exc:  # noqa: BLE001 — show any parse failure
+            QMessageBox.critical(self, "Detections failed", str(exc))
+            return
+        self._detections = detections
+        self._refresh_detection_overlays()
+        shown = sum(
+            1
+            for d in detections
+            if d.confidence >= self._threshold_spin.value()
+        )
+        self._status.setText(
+            f"{csv_path.name}  |  {shown}/{len(detections)} detections "
+            f"(min {self._threshold_spin.value():.2f})"
+        )
+
+    def _on_threshold_changed(self, _value: float) -> None:
+        if self._detections:
+            self._refresh_detection_overlays()
+            shown = sum(
+                1
+                for d in self._detections
+                if d.confidence >= self._threshold_spin.value()
+            )
+            self._status.setText(
+                f"{shown}/{len(self._detections)} detections "
+                f"(min {self._threshold_spin.value():.2f})"
+            )
+
+    def _refresh_detection_overlays(self) -> None:
+        self._clear_detection_overlays()
+        threshold = self._threshold_spin.value()
+        visible = [d for d in self._detections if d.confidence >= threshold]
+        for det, lane in assign_lanes(visible):
+            lane_y = _DETECTION_LANE_TOP_HZ - lane * _DETECTION_LANE_STEP_HZ
+            y0 = lane_y - _DETECTION_TICK_HALF_HZ
+            y1 = lane_y + _DETECTION_TICK_HALF_HZ
+            pen = pg.mkPen(_DETECTION_COLOR, width=2)
+            for t in (det.start_s, det.end_s):
+                tick = pg.PlotDataItem([t, t], [y0, y1], pen=pen)
+                tick.setZValue(10)
+                self._plot.addItem(tick)
+                self._detection_items.append(tick)
+            label = pg.TextItem(
+                f"{det.scientific_name} {det.confidence:.2f}",
+                color=_DETECTION_COLOR,
+                anchor=(0, 1),
+            )
+            label.setPos(det.start_s, lane_y)
+            label.setZValue(11)
+            self._plot.addItem(label)
+            self._detection_items.append(label)
 
     def _clear_box_item(self) -> None:
         if self._box_item is not None:
