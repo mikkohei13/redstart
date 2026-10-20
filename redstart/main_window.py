@@ -627,19 +627,15 @@ class MainWindow(QMainWindow):
                 self._playhead.setValue(self._isolation_origin_s + local)
             else:
                 self._playhead.setValue(self._saved_position_s)
-            if (
-                self._iso_buffer_active
-                and not snap.playing
-                and self._iso_play_btn.text() == "Pause selection"
-            ):
-                self._iso_play_btn.setText("Play selection")
+            if self._iso_buffer_active:
+                self._iso_play_btn.setText(
+                    "Pause selection" if snap.playing else "Play selection"
+                )
             return
 
         t = snap.position_seconds
         self._playhead.setValue(t)
-
-        if snap.finished:
-            self._play_btn.setText("Play")
+        self._play_btn.setText("Pause" if snap.playing else "Play")
 
         width = self._visible_width()
         x0, x1 = self._visible_x_range()
@@ -659,6 +655,3 @@ class MainWindow(QMainWindow):
                         t, width, duration_s=self._document.duration_seconds
                     )
                     self._set_x_range(nx0, nx1)
-
-        if not snap.playing and self._play_btn.text() == "Pause":
-            self._play_btn.setText("Play")
