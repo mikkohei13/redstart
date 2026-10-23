@@ -28,6 +28,7 @@ from redstart.detections import (
     Detection,
     abbreviate_scientific_name,
     assign_lanes,
+    counts_per_minute,
     find_detections_csv,
     load_detections,
 )
@@ -51,6 +52,8 @@ _DETECTION_LANE_STEP_HZ = 700.0
 _DETECTION_TICK_HALF_HZ = 200.0
 _DETECTION_COLOR = (255, 220, 40)
 _DETECTION_COLOR_TURBO = (0, 0, 0)
+_OVERVIEW_HEIGHT_PX = 52
+_OVERVIEW_BAR_COLOR = (80, 160, 255, 180)
 
 # Default folder for the open dialog.
 DEFAULT_AUDIO_DIR = (
@@ -95,6 +98,10 @@ class MainWindow(QMainWindow):
         # Bird detection overlays (loaded with the audio when a companion CSV exists).
         self._detections: list[Detection] = []
         self._detection_items: list[object] = []
+
+        # Full-file detections-per-minute overview (below spectrogram).
+        self._overview_bars: pg.BarGraphItem | None = None
+        self._overview_dragging = False
 
         self._status = QLabel("Open a WAV file to begin.")
         self._open_btn = QPushButton("Open…")
@@ -174,6 +181,28 @@ class MainWindow(QMainWindow):
         self._plot.viewport().setMouseTracking(True)
         self._plot.viewport().installEventFilter(self)
 
+        self._overview = pg.PlotWidget()
+        self._overview.setFixedHeight(_OVERVIEW_HEIGHT_PX)
+        self._overview.setMenuEnabled(False)
+        self._overview.hideAxis("left")
+        self._overview.hideAxis("bottom")
+        self._overview.showGrid(x=False, y=False)
+        overview_vb = self._overview.getViewBox()
+        overview_vb.setMouseEnabled(x=False, y=False)
+        overview_vb.setMenuEnabled(False)
+        self._overview_playhead = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            pen=pg.mkPen("w", width=2),
+            movable=True,
+        )
+        self._overview_playhead.sigDragged.connect(self._on_overview_playhead_dragged)
+        self._overview_playhead.sigPositionChangeFinished.connect(
+            self._on_overview_playhead_drag_finished
+        )
+        self._overview.addItem(self._overview_playhead)
+        self._overview.scene().sigMouseClicked.connect(self._on_overview_click)
+
         controls = QHBoxLayout()
         controls.addWidget(self._open_btn)
         controls.addWidget(self._play_btn)
@@ -189,6 +218,7 @@ class MainWindow(QMainWindow):
 
         root = QVBoxLayout()
         root.addWidget(self._plot, stretch=1)
+        root.addWidget(self._overview, stretch=0)
         root.addLayout(controls)
 
         container = QWidget()
@@ -319,6 +349,8 @@ class MainWindow(QMainWindow):
             f"({document.duration_seconds:.0f}s)…"
         )
         self._playhead.setValue(0.0)
+        self._overview_playhead.setValue(0.0)
+        self._refresh_overview_chart()
         QApplication.processEvents()
 
         QGuiApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
@@ -333,6 +365,7 @@ class MainWindow(QMainWindow):
 
         if error is not None or spectrogram is None:
             self._document = None
+            self._refresh_overview_chart()
             self._status.setText("Spectrogram failed.")
             QMessageBox.critical(self, "Spectrogram failed", str(error))
             return
@@ -347,6 +380,7 @@ class MainWindow(QMainWindow):
         self._play_btn.setEnabled(True)
         self._isolate_btn.setEnabled(True)
         detection_note = self._try_load_detections_for_document()
+        self._refresh_overview_chart()
         status = (
             f"{path.name}  |  {document.duration_seconds:.1f}s  |  "
             f"{document.sample_rate} Hz"
@@ -482,6 +516,7 @@ class MainWindow(QMainWindow):
         self._detections = []
         self._clear_detection_overlays()
         self._set_threshold_controls_enabled(False)
+        self._refresh_overview_chart()
 
     def _clear_detection_overlays(self) -> None:
         for item in self._detection_items:
@@ -506,6 +541,7 @@ class MainWindow(QMainWindow):
             return None
         self._detections = detections
         self._refresh_detection_overlays()
+        self._refresh_overview_chart()
         self._set_threshold_controls_enabled(True)
         shown = sum(
             1
@@ -521,6 +557,7 @@ class MainWindow(QMainWindow):
         if not self._detections:
             return
         self._refresh_detection_overlays()
+        self._refresh_overview_chart()
         shown = sum(
             1
             for d in self._detections
@@ -530,6 +567,46 @@ class MainWindow(QMainWindow):
             f"{shown}/{len(self._detections)} detections "
             f"(min {self._threshold_spin.value():.2f})"
         )
+
+    def _refresh_overview_chart(self) -> None:
+        """Rebuild per-minute bars for the current document and threshold."""
+        if self._overview_bars is not None:
+            self._overview.removeItem(self._overview_bars)
+            self._overview_bars = None
+
+        if self._document is None:
+            self._overview.setXRange(0.0, 1.0, padding=0)
+            self._overview.setYRange(0.0, 1.0, padding=0)
+            self._overview_playhead.setBounds([0.0, 1.0])
+            self._overview_playhead.setValue(0.0)
+            return
+
+        duration = max(self._document.duration_seconds, 1e-3)
+        counts = counts_per_minute(
+            self._detections,
+            self._threshold_spin.value(),
+            self._document.duration_seconds,
+        )
+        n = len(counts)
+        # Bar centers in seconds so the playhead shares document time.
+        x = (np.arange(n, dtype=np.float64) + 0.5) * 60.0
+        width = 60.0 * 0.9
+        self._overview_bars = pg.BarGraphItem(
+            x=x,
+            height=counts.astype(np.float64),
+            width=width,
+            brush=pg.mkBrush(*_OVERVIEW_BAR_COLOR),
+            pen=pg.mkPen(None),
+        )
+        self._overview.addItem(self._overview_bars)
+        self._overview_playhead.setZValue(10)
+        self._overview_playhead.setBounds([0.0, duration])
+        y_max = float(counts.max()) if n else 1.0
+        self._overview.setXRange(0.0, duration, padding=0)
+        self._overview.setYRange(0.0, max(y_max, 1.0), padding=0)
+        overview_vb = self._overview.getViewBox()
+        overview_vb.setLimits(xMin=0.0, xMax=duration, yMin=0.0, yMax=max(y_max, 1.0))
+
 
     def _refresh_detection_overlays(self) -> None:
         self._clear_detection_overlays()
@@ -745,11 +822,52 @@ class MainWindow(QMainWindow):
             return
         mouse_point = self._plot.getViewBox().mapSceneToView(event.scenePos())
         t = float(mouse_point.x())
+        self._seek_to_document_time(t)
+
+    def _seek_to_document_time(self, t: float) -> None:
+        """Seek transport and both playheads; align spectrogram to the new time."""
+        if self._document is None or self._isolation_active:
+            return
         t = max(0.0, min(t, self._document.duration_seconds))
+        self._engine.seek(t)
+        self._playhead.setValue(t)
+        self._overview_playhead.setValue(t)
+        self._drive_x = True
+        self._align_view_to_playhead()
+
+    def _on_overview_click(self, event) -> None:
+        if self._isolation_active or self._overview_dragging:
+            return
+        if self._document is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if event.double():
+            return
+        if not self._overview.sceneBoundingRect().contains(event.scenePos()):
+            return
+        # Clicks on the playhead are handled by drag; skip to avoid double seek.
+        if self._overview_playhead.sceneBoundingRect().contains(event.scenePos()):
+            return
+        mouse_point = self._overview.getViewBox().mapSceneToView(event.scenePos())
+        self._seek_to_document_time(float(mouse_point.x()))
+
+    def _on_overview_playhead_dragged(self) -> None:
+        if self._document is None or self._isolation_active:
+            return
+        self._overview_dragging = True
+        t = float(self._overview_playhead.value())
+        t = max(0.0, min(t, self._document.duration_seconds))
+        self._overview_playhead.setValue(t)
         self._engine.seek(t)
         self._playhead.setValue(t)
         self._drive_x = True
         self._align_view_to_playhead()
+
+    def _on_overview_playhead_drag_finished(self) -> None:
+        self._overview_dragging = False
+        if self._document is None or self._isolation_active:
+            return
+        t = float(self._overview_playhead.value())
+        self._seek_to_document_time(t)
 
     def _on_tick(self) -> None:
         if self._document is None or self._spectrogram is None:
@@ -765,6 +883,9 @@ class MainWindow(QMainWindow):
                 self._playhead.setValue(t0 + local)
             else:
                 self._playhead.setValue(self._saved_position_s)
+            # Overview stays at the saved document position during isolation.
+            if not self._overview_dragging:
+                self._overview_playhead.setValue(self._saved_position_s)
             if self._iso_buffer_active:
                 self._iso_play_btn.setText(
                     "Pause selection" if snap.playing else "Play selection"
@@ -773,6 +894,8 @@ class MainWindow(QMainWindow):
 
         t = snap.position_seconds
         self._playhead.setValue(t)
+        if not self._overview_dragging:
+            self._overview_playhead.setValue(t)
         self._play_btn.setText("Pause" if snap.playing else "Play")
 
         width = self._visible_width()

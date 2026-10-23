@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -13,6 +16,30 @@ class Detection:
     end_s: float
     scientific_name: str
     confidence: float
+
+
+def counts_per_minute(
+    detections: list[Detection],
+    threshold: float,
+    duration_seconds: float,
+) -> np.ndarray:
+    """Count detections at/above threshold in each whole-file minute bin.
+
+    Bin count is ceil(duration/60), at least 1. Each detection is assigned by
+    floor(start_s / 60), clamped into range.
+    """
+    n_bins = max(1, int(math.ceil(max(duration_seconds, 0.0) / 60.0)))
+    counts = np.zeros(n_bins, dtype=np.int32)
+    for det in detections:
+        if det.confidence < threshold:
+            continue
+        minute = int(det.start_s // 60)
+        if minute < 0:
+            minute = 0
+        elif minute >= n_bins:
+            minute = n_bins - 1
+        counts[minute] += 1
+    return counts
 
 
 def abbreviate_scientific_name(name: str) -> str:
