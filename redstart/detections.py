@@ -15,6 +15,14 @@ class Detection:
     confidence: float
 
 
+def abbreviate_scientific_name(name: str) -> str:
+    """First three letters of genus and epithet, no space (e.g. Larus canus → Larcan)."""
+    parts = name.split()
+    if len(parts) >= 2:
+        return f"{parts[0][:3]}{parts[1][:3]}"
+    return name[:6] if name else name
+
+
 def find_detections_csv(audio_path: Path) -> Path | None:
     """Return the first CSV in the audio's directory whose name starts with the stem."""
     audio_path = Path(audio_path)
@@ -54,19 +62,46 @@ def load_detections(csv_path: Path) -> list[Detection]:
     return detections
 
 
+_TOP_SPECIES_LANES = 4
+
+
 def assign_lanes(detections: list[Detection]) -> list[tuple[Detection, int]]:
-    """Greedy lowest-lane assignment so overlapping time ranges do not share a y."""
-    ordered = sorted(detections, key=lambda d: (d.start_s, d.end_s))
-    # lane_ends[i] = end time of the last detection placed in lane i
-    lane_ends: list[float] = []
+    """Place the 4 most common species on fixed lanes; stagger the rest below.
+
+    Lanes 0..3 are the top species by detection count (most common on top).
+    Detections of the same top species share one lane and may overlap.
+    All other species start at lane 4 and are staggered so time ranges do not
+    share a y.
+    """
+    if not detections:
+        return []
+
+    counts: dict[str, int] = {}
+    for det in detections:
+        counts[det.scientific_name] = counts.get(det.scientific_name, 0) + 1
+
+    # Most common first; name break for stable ties.
+    ranked = sorted(counts.keys(), key=lambda name: (-counts[name], name))
+    top = ranked[:_TOP_SPECIES_LANES]
+    top_lane = {name: i for i, name in enumerate(top)}
+    other_base = len(top)  # usually 4; fewer if fewer than 4 species overall
+
     result: list[tuple[Detection, int]] = []
-    for det in ordered:
+    # Relative lane ends for the "other" pool (index 0 == other_base).
+    other_lane_ends: list[float] = []
+
+    for det in sorted(detections, key=lambda d: (d.start_s, d.end_s)):
+        if det.scientific_name in top_lane:
+            result.append((det, top_lane[det.scientific_name]))
+            continue
+
         lane = 0
-        while lane < len(lane_ends) and det.start_s < lane_ends[lane]:
+        while lane < len(other_lane_ends) and det.start_s < other_lane_ends[lane]:
             lane += 1
-        if lane == len(lane_ends):
-            lane_ends.append(det.end_s)
+        if lane == len(other_lane_ends):
+            other_lane_ends.append(det.end_s)
         else:
-            lane_ends[lane] = det.end_s
-        result.append((det, lane))
+            other_lane_ends[lane] = det.end_s
+        result.append((det, other_base + lane))
+
     return result

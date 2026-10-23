@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from redstart.audio_document import AudioDocument, load_wav
 from redstart.detections import (
     Detection,
+    abbreviate_scientific_name,
     assign_lanes,
     find_detections_csv,
     load_detections,
@@ -44,10 +45,12 @@ from redstart.spectrogram import (
 )
 
 # Detection overlays sit near the top of the spectrogram (CSV has no frequency).
-_DETECTION_LANE_TOP_HZ = FREQ_MAX_HZ - 400.0
+# Leave headroom so TextItem (anchor bottom) stays inside the plot.
+_DETECTION_LANE_TOP_HZ = FREQ_MAX_HZ - 1000.0
 _DETECTION_LANE_STEP_HZ = 700.0
 _DETECTION_TICK_HALF_HZ = 200.0
 _DETECTION_COLOR = (255, 220, 40)
+_DETECTION_COLOR_TURBO = (0, 0, 0)
 
 # Default folder for the open dialog.
 DEFAULT_AUDIO_DIR = (
@@ -89,11 +92,16 @@ class MainWindow(QMainWindow):
         self._draw_anchor: QPointF | None = None
         self._box_item: QGraphicsRectItem | None = None
 
-        # Bird detection overlays (loaded from companion CSV on demand).
+        # Bird detection overlays (loaded with the audio when a companion CSV exists).
         self._detections: list[Detection] = []
         self._detection_items: list[object] = []
 
         self._status = QLabel("Open a WAV file to begin.")
+        self._open_btn = QPushButton("Open…")
+        self._open_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._open_btn.setToolTip("Open a WAV file")
+        self._open_btn.clicked.connect(self._open_file_dialog)
+
         self._play_btn = QPushButton("Play")
         self._play_btn.setEnabled(False)
         # Avoid Space activating the button when focused; Space is the window shortcut.
@@ -118,22 +126,23 @@ class MainWindow(QMainWindow):
         self._iso_close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._iso_close_btn.clicked.connect(self._close_isolation_tool)
 
-        self._detections_btn = QPushButton("Detections")
-        self._detections_btn.setEnabled(False)
-        self._detections_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._detections_btn.setToolTip(
-            "Load bird detections from a CSV next to the audio file"
-        )
-        self._detections_btn.clicked.connect(self._load_detections)
-
+        self._threshold_label = QLabel("Min")
         self._threshold_spin = QDoubleSpinBox()
-        self._threshold_spin.setRange(0.0, 1.0)
-        self._threshold_spin.setSingleStep(0.05)
+        self._threshold_spin.setRange(0.01, 1.0)
+        self._threshold_spin.setSingleStep(0.01)
         self._threshold_spin.setDecimals(2)
         self._threshold_spin.setValue(0.75)
         self._threshold_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._threshold_spin.setToolTip("Hide detections below this confidence")
-        self._threshold_spin.valueChanged.connect(self._on_threshold_changed)
+        self._threshold_spin.setToolTip(
+            "Confidence threshold; press Apply to update overlays"
+        )
+        self._apply_threshold_btn = QPushButton("Apply")
+        self._apply_threshold_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._apply_threshold_btn.setToolTip(
+            "Recreate detection overlays with the current threshold"
+        )
+        self._apply_threshold_btn.clicked.connect(self._apply_detection_threshold)
+        self._set_threshold_controls_enabled(False)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Scroll", "scroll")
@@ -166,13 +175,14 @@ class MainWindow(QMainWindow):
         self._plot.viewport().installEventFilter(self)
 
         controls = QHBoxLayout()
+        controls.addWidget(self._open_btn)
         controls.addWidget(self._play_btn)
         controls.addWidget(self._isolate_btn)
         controls.addWidget(self._iso_play_btn)
         controls.addWidget(self._iso_close_btn)
-        controls.addWidget(self._detections_btn)
-        controls.addWidget(QLabel("Min"))
+        controls.addWidget(self._threshold_label)
         controls.addWidget(self._threshold_spin)
+        controls.addWidget(self._apply_threshold_btn)
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self._mode_combo)
         controls.addWidget(self._status, stretch=1)
@@ -192,10 +202,9 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._on_tick)
         self._timer.start()
 
+        # Start empty; user opens a file via the Open button (or CLI path).
         if initial_path is not None:
             self.load_path(initial_path)
-        else:
-            QTimer.singleShot(0, self._open_file_dialog)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -265,8 +274,15 @@ class MainWindow(QMainWindow):
         save_settings(settings)
         self._sync_mode_combo()
         self._apply_display()
+        if self._detections:
+            self._refresh_detection_overlays()
         self._drive_x = True
         self._align_view_to_playhead()
+
+    def _detection_overlay_color(self) -> tuple[int, int, int]:
+        if self._settings.colormap == "turbo":
+            return _DETECTION_COLOR_TURBO
+        return _DETECTION_COLOR
 
     def _apply_display(self) -> None:
         """Update colour LUT and dB levels without recomputing the STFT."""
@@ -290,13 +306,13 @@ class MainWindow(QMainWindow):
         self._document = document
         self._spectrogram = None
         self._clear_detections()
+        self._threshold_spin.setValue(0.75)
         # Drop the previous ImageItem buffer before allocating a new one.
         self._image.clear()
         self._engine.load(document)
         self._play_btn.setEnabled(False)
         self._play_btn.setText("Play")
         self._isolate_btn.setEnabled(False)
-        self._detections_btn.setEnabled(False)
         self.setWindowTitle(f"Redstart — {path.name}")
         self._status.setText(
             f"Computing spectrogram for {path.name} "
@@ -330,11 +346,14 @@ class MainWindow(QMainWindow):
         self._plot.setYRange(0.0, FREQ_MAX_HZ, padding=0)
         self._play_btn.setEnabled(True)
         self._isolate_btn.setEnabled(True)
-        self._detections_btn.setEnabled(True)
-        self._status.setText(
+        detection_note = self._try_load_detections_for_document()
+        status = (
             f"{path.name}  |  {document.duration_seconds:.1f}s  |  "
             f"{document.sample_rate} Hz"
         )
+        if detection_note:
+            status = f"{status}  |  {detection_note}"
+        self._status.setText(status)
 
     def _show_spectrogram(self, data: SpectrogramData) -> None:
         if data.db.size == 0 or data.times_s.size == 0:
@@ -454,74 +473,83 @@ class MainWindow(QMainWindow):
                     f"{self._document.sample_rate} Hz"
                 )
 
+    def _set_threshold_controls_enabled(self, enabled: bool) -> None:
+        self._threshold_label.setEnabled(enabled)
+        self._threshold_spin.setEnabled(enabled)
+        self._apply_threshold_btn.setEnabled(enabled)
+
     def _clear_detections(self) -> None:
         self._detections = []
         self._clear_detection_overlays()
+        self._set_threshold_controls_enabled(False)
 
     def _clear_detection_overlays(self) -> None:
         for item in self._detection_items:
             self._plot.removeItem(item)
         self._detection_items = []
 
-    def _load_detections(self) -> None:
+    def _try_load_detections_for_document(self) -> str | None:
+        """Load companion CSV if present. Returns a short status note, or None."""
         if self._document is None:
-            return
+            return None
         csv_path = find_detections_csv(self._document.path)
         if csv_path is None:
-            self._status.setText("No detection CSV found.")
-            QMessageBox.information(
-                self,
-                "Detections",
-                "No CSV file found that begins with the audio file name.",
-            )
-            return
+            return None
         try:
             detections = load_detections(csv_path)
         except Exception as exc:  # noqa: BLE001 — show any parse failure
-            QMessageBox.critical(self, "Detections failed", str(exc))
-            return
+            QMessageBox.warning(
+                self,
+                "Detections",
+                f"Could not read detection CSV:\n{exc}",
+            )
+            return None
         self._detections = detections
         self._refresh_detection_overlays()
+        self._set_threshold_controls_enabled(True)
         shown = sum(
             1
             for d in detections
             if d.confidence >= self._threshold_spin.value()
         )
-        self._status.setText(
-            f"{csv_path.name}  |  {shown}/{len(detections)} detections "
+        return (
+            f"{shown}/{len(detections)} detections "
             f"(min {self._threshold_spin.value():.2f})"
         )
 
-    def _on_threshold_changed(self, _value: float) -> None:
-        if self._detections:
-            self._refresh_detection_overlays()
-            shown = sum(
-                1
-                for d in self._detections
-                if d.confidence >= self._threshold_spin.value()
-            )
-            self._status.setText(
-                f"{shown}/{len(self._detections)} detections "
-                f"(min {self._threshold_spin.value():.2f})"
-            )
+    def _apply_detection_threshold(self) -> None:
+        if not self._detections:
+            return
+        self._refresh_detection_overlays()
+        shown = sum(
+            1
+            for d in self._detections
+            if d.confidence >= self._threshold_spin.value()
+        )
+        self._status.setText(
+            f"{shown}/{len(self._detections)} detections "
+            f"(min {self._threshold_spin.value():.2f})"
+        )
 
     def _refresh_detection_overlays(self) -> None:
         self._clear_detection_overlays()
         threshold = self._threshold_spin.value()
         visible = [d for d in self._detections if d.confidence >= threshold]
+        color = self._detection_overlay_color()
         for det, lane in assign_lanes(visible):
             lane_y = _DETECTION_LANE_TOP_HZ - lane * _DETECTION_LANE_STEP_HZ
             y0 = lane_y - _DETECTION_TICK_HALF_HZ
             y1 = lane_y + _DETECTION_TICK_HALF_HZ
-            pen = pg.mkPen(_DETECTION_COLOR, width=2)
+            pen = pg.mkPen(color, width=2)
             for t in (det.start_s, det.end_s):
                 tick = pg.PlotDataItem([t, t], [y0, y1], pen=pen)
                 tick.setZValue(10)
                 self._plot.addItem(tick)
                 self._detection_items.append(tick)
             label = pg.TextItem(
-                f"{det.scientific_name} {det.confidence:.2f}",
-                color=_DETECTION_COLOR,
+                f"{abbreviate_scientific_name(det.scientific_name)} "
+                f"{det.confidence:.2f}",
+                color=color,
                 anchor=(0, 1),
             )
             label.setPos(det.start_s, lane_y)
