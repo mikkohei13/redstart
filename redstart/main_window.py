@@ -25,14 +25,17 @@ from PySide6.QtWidgets import (
 
 from redstart.audio_document import AudioDocument, load_audio
 from redstart.detections import (
+    DETECTION_COLORS,
     Detection,
     abbreviate_scientific_name,
     assign_lanes,
     counts_per_minute,
-    find_detections_csv,
+    detection_source_label,
+    find_detections_csvs,
     load_detections,
     rank_species,
 )
+from redstart.detections_dialog import DetectionFilesDialog
 from redstart.isolate import IsolationError, bandpass_slice
 from redstart.playback import PlaybackEngine
 from redstart.settings import AppSettings, ColorPreset, ViewMode, load_settings, save_settings
@@ -52,8 +55,10 @@ _DETECTION_LANE_TOP_HZ = FREQ_MAX_HZ - 1000.0
 _DETECTION_LANE_STEP_HZ = 1000.0
 # Raise top-species segments toward TextItem mid-height (anchor is bottom).
 _DETECTION_TOP_SEGMENT_LIFT_HZ = 400.0
-_DETECTION_COLOR = (255, 220, 40)
-_DETECTION_COLOR_TURBO = (0, 0, 0)
+# Stack multi-source segments within a lane so model lines do not coincide.
+_DETECTION_SOURCE_OFFSET_HZ = 120.0
+# Shared swimlane name colour when several detection sources are shown.
+_DETECTION_LANE_LABEL_COLOR = (240, 240, 240)
 _OVERVIEW_HEIGHT_PX = 52
 _OVERVIEW_BAR_COLOR = (80, 160, 255, 180)
 
@@ -97,8 +102,9 @@ class MainWindow(QMainWindow):
         self._draw_anchor: QPointF | None = None
         self._box_item: QGraphicsRectItem | None = None
 
-        # Bird detection overlays (loaded with the audio when a companion CSV exists).
+        # Bird detection overlays (loaded with the audio when companion CSVs exist).
         self._detections: list[Detection] = []
+        self._detection_sources: list[tuple[str, tuple[int, int, int]]] = []
         self._detection_items: list[object] = []
         # Sticky left-edge labels for the top fixed swimlanes (subset of items above).
         self._lane_labels: list[pg.TextItem] = []
@@ -216,6 +222,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._threshold_label)
         controls.addWidget(self._threshold_spin)
         controls.addWidget(self._apply_threshold_btn)
+        self._source_legend = QLabel("")
+        self._source_legend.setVisible(False)
+        controls.addWidget(self._source_legend)
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self._mode_combo)
         controls.addWidget(self._status, stretch=1)
@@ -313,10 +322,8 @@ class MainWindow(QMainWindow):
         self._drive_x = True
         self._align_view_to_playhead()
 
-    def _detection_overlay_color(self) -> tuple[int, int, int]:
-        if self._settings.colormap == "turbo":
-            return _DETECTION_COLOR_TURBO
-        return _DETECTION_COLOR
+    def _detection_color(self, source_index: int) -> tuple[int, int, int]:
+        return DETECTION_COLORS[source_index % len(DETECTION_COLORS)]
 
     def _apply_display(self) -> None:
         """Update colour LUT and dB levels without recomputing the STFT."""
@@ -519,7 +526,9 @@ class MainWindow(QMainWindow):
 
     def _clear_detections(self) -> None:
         self._detections = []
+        self._detection_sources = []
         self._clear_detection_overlays()
+        self._update_source_legend()
         self._set_threshold_controls_enabled(False)
         self._refresh_overview_chart()
 
@@ -528,6 +537,20 @@ class MainWindow(QMainWindow):
             self._plot.removeItem(item)
         self._detection_items = []
         self._lane_labels = []
+
+    def _update_source_legend(self) -> None:
+        if len(self._detection_sources) < 2:
+            self._source_legend.clear()
+            self._source_legend.setVisible(False)
+            return
+        parts: list[str] = []
+        for label, color in self._detection_sources:
+            r, g, b = color
+            parts.append(
+                f'<span style="color:rgb({r},{g},{b})">{label}</span>'
+            )
+        self._source_legend.setText(" · ".join(parts))
+        self._source_legend.setVisible(True)
 
     def _lane_y(self, lane: int) -> float:
         return _DETECTION_LANE_TOP_HZ - lane * _DETECTION_LANE_STEP_HZ
@@ -542,32 +565,65 @@ class MainWindow(QMainWindow):
             label.setPos(x, self._lane_y(lane))
 
     def _try_load_detections_for_document(self) -> str | None:
-        """Load companion CSV if present. Returns a short status note, or None."""
+        """Load companion CSV(s) if present. Returns a short status note, or None."""
         if self._document is None:
             return None
-        csv_path = find_detections_csv(self._document.path)
-        if csv_path is None:
+        matches = find_detections_csvs(self._document.path)
+        if not matches:
             return None
-        try:
-            detections = load_detections(csv_path)
-        except Exception as exc:  # noqa: BLE001 — show any parse failure
-            QMessageBox.warning(
-                self,
-                "Detections",
-                f"Could not read detection CSV:\n{exc}",
-            )
+
+        selected = matches
+        if len(matches) > 1:
+            dialog = DetectionFilesDialog(matches, self)
+            if dialog.exec() != DetectionFilesDialog.DialogCode.Accepted:
+                return None
+            selected = dialog.selected_paths()
+            if not selected:
+                return None
+
+        audio_stem = self._document.path.stem
+        detections: list[Detection] = []
+        sources: list[tuple[str, tuple[int, int, int]]] = []
+        for index, csv_path in enumerate(selected):
+            label = detection_source_label(csv_path, audio_stem)
+            color = self._detection_color(index)
+            try:
+                loaded = load_detections(
+                    csv_path,
+                    source_index=index,
+                    source_label=label,
+                )
+            except Exception as exc:  # noqa: BLE001 — show any parse failure
+                QMessageBox.warning(
+                    self,
+                    "Detections",
+                    f"Could not read detection CSV:\n{csv_path.name}\n{exc}",
+                )
+                continue
+            detections.extend(loaded)
+            sources.append((label, color))
+
+        if not detections:
             return None
+
         self._detections = detections
+        self._detection_sources = sources
         self._refresh_detection_overlays()
         self._refresh_overview_chart()
+        self._update_source_legend()
         self._set_threshold_controls_enabled(True)
+        return self._detection_status_text()
+
+    def _detection_status_text(self) -> str:
         shown = sum(
             1
-            for d in detections
+            for d in self._detections
             if d.confidence >= self._threshold_spin.value()
         )
+        n_sources = len(self._detection_sources)
+        source_note = f" from {n_sources} files" if n_sources > 1 else ""
         return (
-            f"{shown}/{len(detections)} detections "
+            f"{shown}/{len(self._detections)} detections{source_note} "
             f"(min {self._threshold_spin.value():.2f})"
         )
 
@@ -576,15 +632,7 @@ class MainWindow(QMainWindow):
             return
         self._refresh_detection_overlays()
         self._refresh_overview_chart()
-        shown = sum(
-            1
-            for d in self._detections
-            if d.confidence >= self._threshold_spin.value()
-        )
-        self._status.setText(
-            f"{shown}/{len(self._detections)} detections "
-            f"(min {self._threshold_spin.value():.2f})"
-        )
+        self._status.setText(self._detection_status_text())
 
     def _refresh_overview_chart(self) -> None:
         """Rebuild per-minute bars for the current document and threshold."""
@@ -630,15 +678,20 @@ class MainWindow(QMainWindow):
         self._clear_detection_overlays()
         threshold = self._threshold_spin.value()
         visible = [d for d in self._detections if d.confidence >= threshold]
-        color = self._detection_overlay_color()
         top = rank_species(visible)
         top_set = set(top)
+        multi = len(self._detection_sources) > 1
+        lane_color = (
+            _DETECTION_LANE_LABEL_COLOR
+            if multi
+            else self._detection_color(0)
+        )
 
         # One sticky name per fixed swimlane; updated on pan/scroll.
         for name in top:
             label = pg.TextItem(
                 abbreviate_scientific_name(name),
-                color=color,
+                color=lane_color,
                 anchor=(0, 1),
             )
             label.setZValue(11)
@@ -647,15 +700,19 @@ class MainWindow(QMainWindow):
             self._lane_labels.append(label)
         self._update_lane_label_positions()
 
-        pen = pg.mkPen(color, width=2)
         for det, lane in assign_lanes(visible):
+            color = self._detection_color(det.source_index)
             lane_y = self._lane_y(lane)
+            # Later sources sit slightly lower so overlapping model hits stay visible.
+            source_y = lane_y - det.source_index * _DETECTION_SOURCE_OFFSET_HZ
             is_top = det.scientific_name in top_set
             segment_y = (
-                lane_y + _DETECTION_TOP_SEGMENT_LIFT_HZ if is_top else lane_y
+                source_y + _DETECTION_TOP_SEGMENT_LIFT_HZ if is_top else source_y
             )
             segment = pg.PlotDataItem(
-                [det.start_s, det.end_s], [segment_y, segment_y], pen=pen
+                [det.start_s, det.end_s],
+                [segment_y, segment_y],
+                pen=pg.mkPen(color, width=2),
             )
             segment.setZValue(10)
             self._plot.addItem(segment)
@@ -669,7 +726,7 @@ class MainWindow(QMainWindow):
                 color=color,
                 anchor=(0, 1),
             )
-            label.setPos(det.start_s, lane_y)
+            label.setPos(det.start_s, source_y)
             label.setZValue(11)
             self._plot.addItem(label)
             self._detection_items.append(label)

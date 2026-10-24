@@ -10,12 +10,26 @@ from pathlib import Path
 import numpy as np
 
 
+# Distinct overlay colours for comparing detection CSVs (models) side by side.
+DETECTION_COLORS: tuple[tuple[int, int, int], ...] = (
+    (255, 220, 40),   # yellow
+    (80, 220, 255),   # cyan
+    (255, 100, 200),  # magenta
+    (120, 255, 120),  # lime
+    (255, 140, 60),   # orange
+    (200, 180, 255),  # lavender
+)
+
+
 @dataclass(frozen=True)
 class Detection:
     start_s: float
     end_s: float
     scientific_name: str
     confidence: float
+    # Index into DETECTION_COLORS / loaded source list (for multi-model compare).
+    source_index: int = 0
+    source_label: str = ""
 
 
 def counts_per_minute(
@@ -42,33 +56,87 @@ def counts_per_minute(
     return counts
 
 
+_TAXON_ABBREVIATIONS: dict[str, str] | None = None
+
+
+def _load_taxon_abbreviations() -> dict[str, str]:
+    """scientific name → abbreviation from packaged taxon_names.csv."""
+    global _TAXON_ABBREVIATIONS
+    if _TAXON_ABBREVIATIONS is not None:
+        return _TAXON_ABBREVIATIONS
+    path = Path(__file__).resolve().parent / "data" / "taxon_names.csv"
+    mapping: dict[str, str] = {}
+    # utf-8-sig strips a BOM if present on the header row.
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            scientific = (row.get("scientific") or "").strip()
+            abbreviation = (row.get("abbreviation") or "").strip()
+            if scientific and abbreviation:
+                mapping[scientific] = abbreviation
+    _TAXON_ABBREVIATIONS = mapping
+    return mapping
+
+
 def abbreviate_scientific_name(name: str) -> str:
-    """First three letters of genus and epithet, no space (e.g. Larus canus → Larcan)."""
+    """Abbreviation from taxon_names.csv, else ``G. epithet`` (e.g. L. canus)."""
+    name = (name or "").strip()
+    if not name:
+        return name
+    found = _load_taxon_abbreviations().get(name)
+    if found:
+        return found
     parts = name.split()
     if len(parts) >= 2:
-        return f"{parts[0][:3]}{parts[1][:3]}"
-    return name[:6] if name else name
+        return f"{parts[0][0].upper()}. {parts[1]}"
+    return name
 
 
-def find_detections_csv(audio_path: Path) -> Path | None:
-    """Return the first matching CSV beside the audio, else in the parent folder.
+def find_detections_csvs(audio_path: Path) -> list[Path]:
+    """Return matching CSVs beside the audio, then in the parent folder.
 
     A match is a ``*.csv`` whose filename starts with the audio stem.
+    Same-folder hits come first; paths are unique and sorted within each folder.
     """
     audio_path = Path(audio_path)
     stem = audio_path.stem
+    found: list[Path] = []
+    seen: set[Path] = set()
     for directory in (audio_path.parent, audio_path.parent.parent):
         if not directory.is_dir():
             continue
         matches = sorted(
             p for p in directory.glob("*.csv") if p.name.startswith(stem)
         )
-        if matches:
-            return matches[0]
-    return None
+        for path in matches:
+            key = path.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+    return found
 
 
-def load_detections(csv_path: Path) -> list[Detection]:
+def detection_source_label(csv_path: Path, audio_stem: str) -> str:
+    """Short label from a companion CSV name (e.g. BirdNET, Muuttolinnut)."""
+    name = Path(csv_path).name
+    if name.startswith(audio_stem):
+        rest = name[len(audio_stem) :].lstrip(".")
+        if rest.lower().endswith(".csv"):
+            rest = rest[:-4]
+        if rest.lower().endswith(".results"):
+            rest = rest[: -len(".results")]
+        rest = rest.strip(".")
+        if rest:
+            return rest
+    return Path(csv_path).stem
+
+
+def load_detections(
+    csv_path: Path,
+    *,
+    source_index: int = 0,
+    source_label: str = "",
+) -> list[Detection]:
     """Parse a BirdNET results CSV into Detection rows."""
     csv_path = Path(csv_path)
     detections: list[Detection] = []
@@ -89,6 +157,8 @@ def load_detections(csv_path: Path) -> list[Detection]:
                     end_s=float(row["End (s)"]),
                     scientific_name=row["Scientific name"].strip(),
                     confidence=float(row["Confidence"]),
+                    source_index=source_index,
+                    source_label=source_label,
                 )
             )
     return detections
@@ -101,7 +171,10 @@ def rank_species(
     detections: list[Detection],
     n: int = _TOP_SPECIES_LANES,
 ) -> list[str]:
-    """Most common scientific names first, up to n (name break for ties)."""
+    """Most common scientific names first, up to n (name break for ties).
+
+    Counts pool detections from every loaded source file.
+    """
     if not detections or n <= 0:
         return []
     counts: dict[str, int] = {}
@@ -114,10 +187,10 @@ def rank_species(
 def assign_lanes(detections: list[Detection]) -> list[tuple[Detection, int]]:
     """Place the 4 most common species on fixed lanes; stagger the rest below.
 
-    Lanes 0..3 are the top species by detection count (most common on top).
-    Detections of the same top species share one lane and may overlap.
-    All other species start at lane 4 and are staggered so time ranges do not
-    share a y.
+    Lanes 0..3 are the top species by pooled detection count across all sources
+    (most common on top). Same-species hits from different sources share a lane;
+    the view offsets each source vertically. All other species start at lane 4
+    and are staggered so time ranges do not share a y.
     """
     if not detections:
         return []
