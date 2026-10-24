@@ -1,7 +1,7 @@
 [project]
 name = "redstart"
 version = "0.1.0"
-description = "Desktop spectrogram player for long WAV recordings"
+description = "Desktop spectrogram player for long WAV/FLAC recordings"
 readme = "ARCHITECTURE.md"
 requires-python = ">=3.11"
 dependencies = [

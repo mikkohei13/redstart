@@ -51,16 +51,21 @@ def abbreviate_scientific_name(name: str) -> str:
 
 
 def find_detections_csv(audio_path: Path) -> Path | None:
-    """Return the first CSV in the audio's directory whose name starts with the stem."""
+    """Return the first matching CSV beside the audio, else in the parent folder.
+
+    A match is a ``*.csv`` whose filename starts with the audio stem.
+    """
     audio_path = Path(audio_path)
     stem = audio_path.stem
-    directory = audio_path.parent
-    if not directory.is_dir():
-        return None
-    matches = sorted(
-        p for p in directory.glob("*.csv") if p.name.startswith(stem)
-    )
-    return matches[0] if matches else None
+    for directory in (audio_path.parent, audio_path.parent.parent):
+        if not directory.is_dir():
+            continue
+        matches = sorted(
+            p for p in directory.glob("*.csv") if p.name.startswith(stem)
+        )
+        if matches:
+            return matches[0]
+    return None
 
 
 def load_detections(csv_path: Path) -> list[Detection]:
@@ -92,6 +97,20 @@ def load_detections(csv_path: Path) -> list[Detection]:
 _TOP_SPECIES_LANES = 4
 
 
+def rank_species(
+    detections: list[Detection],
+    n: int = _TOP_SPECIES_LANES,
+) -> list[str]:
+    """Most common scientific names first, up to n (name break for ties)."""
+    if not detections or n <= 0:
+        return []
+    counts: dict[str, int] = {}
+    for det in detections:
+        counts[det.scientific_name] = counts.get(det.scientific_name, 0) + 1
+    ranked = sorted(counts.keys(), key=lambda name: (-counts[name], name))
+    return ranked[:n]
+
+
 def assign_lanes(detections: list[Detection]) -> list[tuple[Detection, int]]:
     """Place the 4 most common species on fixed lanes; stagger the rest below.
 
@@ -103,13 +122,7 @@ def assign_lanes(detections: list[Detection]) -> list[tuple[Detection, int]]:
     if not detections:
         return []
 
-    counts: dict[str, int] = {}
-    for det in detections:
-        counts[det.scientific_name] = counts.get(det.scientific_name, 0) + 1
-
-    # Most common first; name break for stable ties.
-    ranked = sorted(counts.keys(), key=lambda name: (-counts[name], name))
-    top = ranked[:_TOP_SPECIES_LANES]
+    top = rank_species(detections)
     top_lane = {name: i for i, name in enumerate(top)}
     other_base = len(top)  # usually 4; fewer if fewer than 4 species overall
 

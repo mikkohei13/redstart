@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         "path",
         nargs="?",
         type=Path,
-        help="WAV file to open (optional; file dialog if omitted)",
+        help="WAV or FLAC file to open (optional; file dialog if omitted)",
     )
     args = parser.parse_args(argv)
 

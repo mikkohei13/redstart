@@ -46,7 +46,13 @@ Omit the path to open a file dialog (defaults to `audio/thorsvik/data`).
 ## Possible future features
 
 - Show x-axis always as seconds, now shows sometimes ks
+- Find out why on scroll more the audio freezes for very short time periods, many times over a minute
+- Support flac and mp3
+- Get CVS files from parent folder as well
+- Handle a whole folder of audio files (for annotations)
+- Make annotations
 - Save annotations to CSV/JSON file
+- Collect annotations into a set, then find more similar ones
 - Export audio files
 - Export observations
 - Cache spectrogram locally

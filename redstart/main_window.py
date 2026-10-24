@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redstart.audio_document import AudioDocument, load_wav
+from redstart.audio_document import AudioDocument, load_audio
 from redstart.detections import (
     Detection,
     abbreviate_scientific_name,
@@ -31,6 +31,7 @@ from redstart.detections import (
     counts_per_minute,
     find_detections_csv,
     load_detections,
+    rank_species,
 )
 from redstart.isolate import IsolationError, bandpass_slice
 from redstart.playback import PlaybackEngine
@@ -48,8 +49,9 @@ from redstart.spectrogram import (
 # Detection overlays sit near the top of the spectrogram (CSV has no frequency).
 # Leave headroom so TextItem (anchor bottom) stays inside the plot.
 _DETECTION_LANE_TOP_HZ = FREQ_MAX_HZ - 1000.0
-_DETECTION_LANE_STEP_HZ = 700.0
-_DETECTION_TICK_HALF_HZ = 200.0
+_DETECTION_LANE_STEP_HZ = 1000.0
+# Raise top-species segments toward TextItem mid-height (anchor is bottom).
+_DETECTION_TOP_SEGMENT_LIFT_HZ = 400.0
 _DETECTION_COLOR = (255, 220, 40)
 _DETECTION_COLOR_TURBO = (0, 0, 0)
 _OVERVIEW_HEIGHT_PX = 52
@@ -98,15 +100,17 @@ class MainWindow(QMainWindow):
         # Bird detection overlays (loaded with the audio when a companion CSV exists).
         self._detections: list[Detection] = []
         self._detection_items: list[object] = []
+        # Sticky left-edge labels for the top fixed swimlanes (subset of items above).
+        self._lane_labels: list[pg.TextItem] = []
 
         # Full-file detections-per-minute overview (below spectrogram).
         self._overview_bars: pg.BarGraphItem | None = None
         self._overview_dragging = False
 
-        self._status = QLabel("Open a WAV file to begin.")
+        self._status = QLabel("Open a WAV or FLAC file to begin.")
         self._open_btn = QPushButton("Open…")
         self._open_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._open_btn.setToolTip("Open a WAV file")
+        self._open_btn.setToolTip("Open a WAV or FLAC file")
         self._open_btn.clicked.connect(self._open_file_dialog)
 
         self._play_btn = QPushButton("Play")
@@ -327,7 +331,7 @@ class MainWindow(QMainWindow):
             self._exit_isolation(restore_document=False)
 
         try:
-            document = load_wav(path)
+            document = load_audio(path)
         except Exception as exc:  # noqa: BLE001 — show any load failure
             QMessageBox.critical(self, "Load failed", str(exc))
             return
@@ -414,9 +418,10 @@ class MainWindow(QMainWindow):
         )
         path_str, _ = QFileDialog.getOpenFileName(
             self,
-            "Open WAV",
+            "Open audio",
             start_dir,
-            "WAV files (*.wav *.WAV);;All files (*)",
+            "Audio files (*.wav *.WAV *.flac *.FLAC);;WAV files (*.wav *.WAV);;"
+            "FLAC files (*.flac *.FLAC);;All files (*)",
         )
         if path_str:
             self.load_path(Path(path_str))
@@ -522,6 +527,19 @@ class MainWindow(QMainWindow):
         for item in self._detection_items:
             self._plot.removeItem(item)
         self._detection_items = []
+        self._lane_labels = []
+
+    def _lane_y(self, lane: int) -> float:
+        return _DETECTION_LANE_TOP_HZ - lane * _DETECTION_LANE_STEP_HZ
+
+    def _update_lane_label_positions(self) -> None:
+        """Keep top-species labels pinned to the visible left edge."""
+        if not self._lane_labels:
+            return
+        x0, x1 = self._visible_x_range()
+        x = x0 + 0.01 * max(x1 - x0, 1e-3)
+        for lane, label in enumerate(self._lane_labels):
+            label.setPos(x, self._lane_y(lane))
 
     def _try_load_detections_for_document(self) -> str | None:
         """Load companion CSV if present. Returns a short status note, or None."""
@@ -613,16 +631,38 @@ class MainWindow(QMainWindow):
         threshold = self._threshold_spin.value()
         visible = [d for d in self._detections if d.confidence >= threshold]
         color = self._detection_overlay_color()
+        top = rank_species(visible)
+        top_set = set(top)
+
+        # One sticky name per fixed swimlane; updated on pan/scroll.
+        for name in top:
+            label = pg.TextItem(
+                abbreviate_scientific_name(name),
+                color=color,
+                anchor=(0, 1),
+            )
+            label.setZValue(11)
+            self._plot.addItem(label)
+            self._detection_items.append(label)
+            self._lane_labels.append(label)
+        self._update_lane_label_positions()
+
+        pen = pg.mkPen(color, width=2)
         for det, lane in assign_lanes(visible):
-            lane_y = _DETECTION_LANE_TOP_HZ - lane * _DETECTION_LANE_STEP_HZ
-            y0 = lane_y - _DETECTION_TICK_HALF_HZ
-            y1 = lane_y + _DETECTION_TICK_HALF_HZ
-            pen = pg.mkPen(color, width=2)
-            for t in (det.start_s, det.end_s):
-                tick = pg.PlotDataItem([t, t], [y0, y1], pen=pen)
-                tick.setZValue(10)
-                self._plot.addItem(tick)
-                self._detection_items.append(tick)
+            lane_y = self._lane_y(lane)
+            is_top = det.scientific_name in top_set
+            segment_y = (
+                lane_y + _DETECTION_TOP_SEGMENT_LIFT_HZ if is_top else lane_y
+            )
+            segment = pg.PlotDataItem(
+                [det.start_s, det.end_s], [segment_y, segment_y], pen=pen
+            )
+            segment.setZValue(10)
+            self._plot.addItem(segment)
+            self._detection_items.append(segment)
+            # Top species are identified by the sticky lane labels above.
+            if is_top:
+                continue
             label = pg.TextItem(
                 f"{abbreviate_scientific_name(det.scientific_name)} "
                 f"{det.confidence:.2f}",
@@ -760,6 +800,7 @@ class MainWindow(QMainWindow):
             self._plot.setXRange(x0, x1, padding=0)
         finally:
             self._ignore_range_signal = False
+        self._update_lane_label_positions()
 
     def _on_manual_range(self, *_args) -> None:
         if self._ignore_range_signal or self._isolation_active:
@@ -782,6 +823,7 @@ class MainWindow(QMainWindow):
 
         # Page: user may free-pan until playback hits a page boundary.
         self._drive_x = False
+        self._update_lane_label_positions()
 
     def _visible_x_range(self) -> tuple[float, float]:
         x0, x1 = self._plot.getViewBox().viewRange()[0]

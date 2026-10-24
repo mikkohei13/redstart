@@ -28,8 +28,11 @@ class AudioDocument:
         return self.samples.shape[0]
 
 
-def load_wav(path: Path | str) -> AudioDocument:
-    """Decode an entire mono WAV into float32 samples shaped (n, 1)."""
+def load_audio(path: Path | str) -> AudioDocument:
+    """Decode an entire mono audio file into float32 samples shaped (n, 1).
+
+    Formats supported by libsndfile (via soundfile), including WAV and FLAC.
+    """
     path = Path(path)
     data, sample_rate = sf.read(path, dtype="float32", always_2d=True)
 
